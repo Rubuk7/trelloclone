@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
+import { supabase } from "@/lib/supabase";
 
 const ID = () => `${Date.now().toString(36)}-${Math.random().toString(36).substr(2,8)}`;
 const now = () => new Date().toISOString();
@@ -9,12 +10,35 @@ const fmtTime = iso => { try{return new Date(iso).toLocaleString("en-US",{month:
 const addDays = (s,n) => { const d=new Date(s+"T12:00:00"); d.setDate(d.getDate()+n); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; };
 const midDate = (a,b) => { const s=new Date(a+"T12:00:00"),e=new Date(b+"T12:00:00"),m=new Date((s.getTime()+e.getTime())/2); return `${m.getFullYear()}-${String(m.getMonth()+1).padStart(2,"0")}-${String(m.getDate()).padStart(2,"0")}`; };
 const daysBetween = (a,b) => Math.round((new Date(b+"T12:00:00")-new Date(a+"T12:00:00"))/86400000);
-const hashPw = p => { let h=0; for(let i=0;i<p.length;i++){h=((h<<5)-h)+p.charCodeAt(i);h|=0;} return "h_"+Math.abs(h).toString(36); };
 const log = (who,action,detail="") => ({id:ID(),who,action,detail,at:now()});
 
-const S = {
-  async get(k,sh=false){try{const r=await window.storage.get(k,sh);return r?JSON.parse(r.value):null;}catch{return null;}},
-  async set(k,v,sh=false){try{await window.storage.set(k,JSON.stringify(v),sh);}catch(e){console.error(e);}},
+// ── Supabase DB helpers ──────────────────────────────────────────────────────
+const DB = {
+  async getBoards(userId){
+    const {data}=await supabase.from("boards").select("*").contains("members",[userId]);
+    return data||[];
+  },
+  async upsertBoard(board){
+    const {data,error}=await supabase.from("boards").upsert(board,{onConflict:"id"}).select().single();
+    if(error)console.error("upsertBoard",error);
+    return data||board;
+  },
+  async getBoardByInvite(code){
+    const {data}=await supabase.from("boards").select("*").eq("invite_code",code).maybeSingle();
+    return data||null;
+  },
+  async getCards(boardId){
+    const {data}=await supabase.from("cards").select("*").eq("board_id",boardId);
+    return(data||[]).map(r=>({...r.data,id:r.id,board_id:r.board_id}));
+  },
+  async upsertCard(boardId,card){
+    const {error}=await supabase.from("cards").upsert({id:card.id,board_id:boardId,data:card},{onConflict:"id"});
+    if(error)console.error("upsertCard",error);
+  },
+  async deleteCard(cardId){
+    const {error}=await supabase.from("cards").delete().eq("id",cardId);
+    if(error)console.error("deleteCard",error);
+  },
 };
 
 const THEMES = {
@@ -92,13 +116,16 @@ function Changelog({data,T}){
   ))}</div>);
 }
 
-// Auth
+// Auth (Supabase)
 function Auth({onLogin,T,theme,toggle}){
   const [mode,setMode]=useState("login");const[email,setEmail]=useState("");const[pw,setPw]=useState("");const[pw2,setPw2]=useState("");const[name,setName]=useState("");const[err,setErr]=useState("");const[msg,setMsg]=useState("");
-  const go=async()=>{setErr("");setMsg("");if(!email.trim())return setErr("Email required");const users=(await S.get("pf-users",true))||[];
-    if(mode==="reset"){const u=users.find(u=>u.email===email.toLowerCase().trim());if(!u)return setErr("No account found");if(!pw||pw.length<6)return setErr("6+ chars required");if(pw!==pw2)return setErr("Passwords don't match");u.passwordHash=hashPw(pw);u.lastLogin=Date.now();await S.set("pf-users",users,true);setMsg("Password reset!");setMode("login");setPw("");setPw2("");return;}
-    if(mode==="signup"){if(!name.trim())return setErr("Name required");if(pw.length<6)return setErr("6+ chars required");if(pw!==pw2)return setErr("Passwords don't match");if(users.find(u=>u.email===email.toLowerCase().trim()))return setErr("Email taken");const cs=["#63d297","#5ba4f5","#f5a623","#b07cff","#ef5f5f","#e891dc","#45c7d1"];const u={id:ID(),email:email.toLowerCase().trim(),passwordHash:hashPw(pw),name:name.trim(),avatar:name.trim()[0].toUpperCase(),color:cs[Math.floor(Math.random()*cs.length)],lastLogin:Date.now(),createdAt:Date.now()};users.push(u);await S.set("pf-users",users,true);onLogin(u);}
-    else{const u=users.find(u=>u.email===email.toLowerCase().trim()&&u.passwordHash===hashPw(pw));if(!u)return setErr("Invalid credentials");if(u.lastLogin&&(Date.now()-u.lastLogin)>90*86400000)return setErr("Login expired (90d). Reset password.");u.lastLogin=Date.now();await S.set("pf-users",users,true);onLogin(u);}
+  const go=async()=>{setErr("");setMsg("");if(!email.trim())return setErr("Email required");
+    if(mode==="reset"){if(!email.trim())return setErr("Email required");const{error}=await supabase.auth.resetPasswordForEmail(email.toLowerCase().trim(),{redirectTo:window.location.origin});if(error)return setErr(error.message);setMsg("Reset email sent! Check your inbox.");setMode("login");return;}
+    if(mode==="signup"){if(!name.trim())return setErr("Name required");if(pw.length<6)return setErr("6+ chars required");if(pw!==pw2)return setErr("Passwords don't match");
+      const{data,error}=await supabase.auth.signUp({email:email.toLowerCase().trim(),password:pw,options:{data:{name:name.trim(),avatar:name.trim()[0].toUpperCase(),color:["#63d297","#5ba4f5","#f5a623","#b07cff","#ef5f5f","#e891dc","#45c7d1"][Math.floor(Math.random()*7)],theme:"dark"}}});
+      if(error)return setErr(error.message);if(data.user){const meta=data.user.user_metadata;onLogin({id:data.user.id,email:data.user.email,name:meta.name,avatar:meta.avatar,color:meta.color});}}
+    else{const{data,error}=await supabase.auth.signInWithPassword({email:email.toLowerCase().trim(),password:pw});
+      if(error)return setErr(error.message);const meta=data.user.user_metadata;onLogin({id:data.user.id,email:data.user.email,name:meta.name||data.user.email,avatar:(meta.name||data.user.email)[0].toUpperCase(),color:meta.color||"#63d297"});}
   };
   return(<div style={{minHeight:"100vh",background:T.bg,display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'Outfit',sans-serif",padding:20}}>
     <div style={{width:"100%",maxWidth:400,padding:"40px 32px",borderRadius:24,background:T.sf,border:`1px solid ${T.bd}`,boxShadow:"0 40px 80px rgba(0,0,0,.25)",position:"relative"}}>
@@ -108,21 +135,23 @@ function Auth({onLogin,T,theme,toggle}){
       {mode!=="reset"&&<div style={{display:"flex",marginBottom:24,background:T.iB,borderRadius:10,padding:3}}>{["login","signup"].map(m=><button key={m} onClick={()=>{setMode(m);setErr("");setMsg("");}} className="pf-btn" style={{flex:1,padding:"8px 0",borderRadius:8,border:"none",fontSize:13,fontWeight:600,background:mode===m?T.cH:"transparent",color:mode===m?T.tx:T.txM}}>{m==="login"?"Sign In":"Sign Up"}</button>)}</div>}
       {mode==="signup"&&<In T={T} value={name} onChange={e=>setName(e.target.value)} placeholder="Full name" style={{marginBottom:10}}/>}
       <In T={T} value={email} onChange={e=>setEmail(e.target.value)} placeholder="Email" type="email" style={{marginBottom:10}}/>
-      <In T={T} value={pw} onChange={e=>setPw(e.target.value)} placeholder={mode==="reset"?"New password":"Password"} type="password" style={{marginBottom:mode==="login"?4:10}} onKeyDown={e=>e.key==="Enter"&&mode==="login"&&go()}/>
-      {(mode==="signup"||mode==="reset")&&<In T={T} value={pw2} onChange={e=>setPw2(e.target.value)} placeholder="Confirm password" type="password" style={{marginBottom:4}} onKeyDown={e=>e.key==="Enter"&&go()}/>}
+      {mode!=="reset"&&<In T={T} value={pw} onChange={e=>setPw(e.target.value)} placeholder="Password" type="password" style={{marginBottom:mode==="login"?4:10}} onKeyDown={e=>e.key==="Enter"&&mode==="login"&&go()}/>}
+      {mode==="signup"&&<In T={T} value={pw2} onChange={e=>setPw2(e.target.value)} placeholder="Confirm password" type="password" style={{marginBottom:4}} onKeyDown={e=>e.key==="Enter"&&go()}/>}
       {mode==="login"&&<button onClick={()=>{setMode("reset");setErr("");}} className="pf-btn" style={{background:"none",border:"none",color:T.ac,fontSize:12,padding:"4px 0",marginBottom:12,display:"block"}}>Forgot password?</button>}
       {mode==="reset"&&<button onClick={()=>{setMode("login");setErr("");}} className="pf-btn" style={{background:"none",border:"none",color:T.ac,fontSize:12,padding:"4px 0",marginBottom:8,display:"block"}}>Back to sign in</button>}
       {err&&<p style={{color:T.dg,fontSize:13,margin:"8px 0"}}>{err}</p>}{msg&&<p style={{color:T.ac,fontSize:13,margin:"8px 0"}}>{msg}</p>}
-      <Bt T={T} v="accent" sz="lg" onClick={go} style={{width:"100%",marginTop:12}}>{mode==="login"?"Sign In":mode==="signup"?"Create Account":"Reset Password"}</Bt>
+      <Bt T={T} v="accent" sz="lg" onClick={go} style={{width:"100%",marginTop:12}}>{mode==="login"?"Sign In":mode==="signup"?"Create Account":"Send Reset Email"}</Bt>
     </div>
   </div>);
 }
 
 // Board Home
+
+// Board Home
 function BHome({user,boards,onSelect,onCreate,onLogout,T,theme,toggle}){
   const[show,setShow]=useState(false);const[nm,setNm]=useState("");const[jc,setJc]=useState("");const[je,setJe]=useState("");
   const mk=()=>{if(!nm.trim())return;onCreate(nm.trim());setNm("");setShow(false);};
-  const join=async()=>{setJe("");if(!jc.trim())return setJe("Paste invite code");const all=(await S.get("pf-all-boards",true))||[];const b=all.find(b=>b.inviteCode===jc.trim());if(!b)return setJe("Invalid code");if(!b.members.includes(user.id)){b.members.push(user.id);await S.set("pf-all-boards",all,true);}onSelect(b);setJc("");};
+  const join=async()=>{setJe("");if(!jc.trim())return setJe("Paste invite code");const b=await DB.getBoardByInvite(jc.trim());if(!b)return setJe("Invalid code");if(!b.members.includes(user.id)){b.members.push(user.id);await DB.upsertBoard(b);}onSelect(b);setJc("");};
   return(<div style={{minHeight:"100vh",background:T.bg,fontFamily:"'Outfit',sans-serif",padding:20}}>
     <div style={{maxWidth:700,margin:"0 auto",paddingTop:40}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:40,flexWrap:"wrap",gap:12}}>
@@ -280,25 +309,100 @@ function CalView({cards,onToggleCP,onCardOpen,T}){
 // ═══ MAIN APP ═══
 export default function PackFlow(){
   const[theme,setTheme]=useState("dark");const[user,setUser]=useState(null);const[boards,setBoards]=useState([]);const[ab,setAb]=useState(null);const[cards,setCards]=useState([]);const[view,setView]=useState("board");const[selCard,setSelCard]=useState(null);const[addCol,setAddCol]=useState(null);const[editCol,setEditCol]=useState(null);const[showSett,setShowSett]=useState(false);const[showAddCol,setShowAddCol]=useState(false);const[newColNm,setNewColNm]=useState("");const[allUsers,setAllUsers]=useState([]);const[loading,setLoading]=useState(true);const sRef=useRef(null);
-  const T=THEMES[theme];const toggle=async()=>{const n=theme==="dark"?"light":"dark";setTheme(n);await S.set("pf-theme",n);};
-  useEffect(()=>{(async()=>{const st=await S.get("pf-theme");if(st)setTheme(st);const u=await S.get("pf-session");if(u){const us=(await S.get("pf-users",true))||[];const f=us.find(x=>x.id===u.id);if(f&&f.lastLogin&&(Date.now()-f.lastLogin)>90*86400000){await S.set("pf-session",null);setLoading(false);return;}setUser(u);}setAllUsers((await S.get("pf-users",true))||[]);setLoading(false);})();},[]);
-  useEffect(()=>{if(!user)return;(async()=>{const all=(await S.get("pf-all-boards",true))||[];setBoards(all.filter(b=>b.members?.includes(user.id)));setAllUsers((await S.get("pf-users",true))||[]);})();},[user]);
-  useEffect(()=>{if(!ab){setCards([]);return;}(async()=>{const sv=(await S.get(`pf-cards-${ab.id}`,true))||[];setCards(pDel(sv));})();},[ab]);
-  useEffect(()=>{if(!ab)return;if(sRef.current)clearTimeout(sRef.current);sRef.current=setTimeout(()=>{S.set(`pf-cards-${ab.id}`,cards,true);},400);return()=>{if(sRef.current)clearTimeout(sRef.current);};},[cards,ab]);
-  const svBoard=useCallback(async b=>{const all=(await S.get("pf-all-boards",true))||[];const i=all.findIndex(x=>x.id===b.id);if(i>=0)all[i]=b;else all.push(b);await S.set("pf-all-boards",all,true);setAb(b);setBoards(prev=>prev.map(x=>x.id===b.id?b:x));},[]);
+  const T=THEMES[theme];
+  const toggle=async()=>{const n=theme==="dark"?"light":"dark";setTheme(n);await supabase.auth.updateUser({data:{theme:n}});};
+
+  // ── Init: restore session ──
+  useEffect(()=>{
+    supabase.auth.getSession().then(async({data:{session}})=>{
+      if(session){
+        const meta=session.user.user_metadata;
+        const u={id:session.user.id,email:session.user.email,name:meta.name||session.user.email,avatar:(meta.name||session.user.email)[0].toUpperCase(),color:meta.color||"#63d297"};
+        setUser(u);
+        if(meta.theme)setTheme(meta.theme);
+      }
+      setLoading(false);
+    });
+    const{data:{subscription}}=supabase.auth.onAuthStateChange((_event,session)=>{
+      if(!session){setUser(null);setAb(null);setCards([]);}
+    });
+    return()=>subscription.unsubscribe();
+  },[]);
+
+  // ── Load boards when user changes ──
+  useEffect(()=>{
+    if(!user)return;
+    (async()=>{
+      const bs=await DB.getBoards(user.id);
+      setBoards(bs);
+      // Build allUsers list from board members (best-effort from metadata)
+      setAllUsers([user]);
+    })();
+  },[user]);
+
+  // ── Load cards when active board changes ──
+  useEffect(()=>{
+    if(!ab){setCards([]);return;}
+    (async()=>{
+      const raw=await DB.getCards(ab.id);
+      setCards(pDel(raw));
+    })();
+  },[ab]);
+
+  // ── Debounced card save ──
+  useEffect(()=>{
+    if(!ab||cards.length===0)return;
+    if(sRef.current)clearTimeout(sRef.current);
+    sRef.current=setTimeout(()=>{
+      cards.forEach(c=>DB.upsertCard(ab.id,c));
+    },600);
+    return()=>{if(sRef.current)clearTimeout(sRef.current);};
+  },[cards,ab]);
+
+  const svBoard=useCallback(async b=>{
+    const saved=await DB.upsertBoard(b);
+    const updated=saved||b;
+    setAb(updated);
+    setBoards(prev=>prev.map(x=>x.id===updated.id?updated:x));
+  },[]);
+
   const pDel=data=>{const td2=today();return data.map(c=>{if(!c.checkpoints)return c;const cp={...c.checkpoints};let ch=false;Object.entries(cp).forEach(([k,v])=>{if(!v.checked&&v.date<td2){cp[k]={...v,date:td2,delayed:true};ch=true;}});return ch?{...c,checkpoints:cp}:c;});};
-  const login=async u=>{setUser(u);await S.set("pf-session",u);const all=(await S.get("pf-all-boards",true))||[];setBoards(all.filter(b=>b.members?.includes(u.id)));setAllUsers((await S.get("pf-users",true))||[]);};
-  const logout=async()=>{setUser(null);setAb(null);setCards([]);await S.set("pf-session",null);};
-  const mkBoard=async nm=>{const b={id:ID(),name:nm,ownerId:user.id,members:[user.id],columns:DEFCOLS.map(c=>({...c,id:ID()})),color:["#63d297","#5ba4f5","#f5a623","#b07cff","#ef5f5f"][Math.floor(Math.random()*5)],inviteCode:ID().toUpperCase().substr(0,8),createdAt:Date.now()};const all=(await S.get("pf-all-boards",true))||[];all.push(b);await S.set("pf-all-boards",all,true);setBoards(prev=>[...prev,b]);setAb(b);};
-  const selBoard=async b=>{const all=(await S.get("pf-all-boards",true))||[];setAb(all.find(x=>x.id===b.id)||b);};
+
+  const login=async u=>{
+    setUser(u);
+    const bs=await DB.getBoards(u.id);
+    setBoards(bs);
+    setAllUsers([u]);
+  };
+
+  const logout=async()=>{
+    await supabase.auth.signOut();
+    setUser(null);setAb(null);setCards([]);setBoards([]);
+  };
+
+  const mkBoard=async nm=>{
+    const b={id:ID(),name:nm,owner_id:user.id,members:[user.id],columns:DEFCOLS.map(c=>({...c,id:ID()})),color:["#63d297","#5ba4f5","#f5a623","#b07cff","#ef5f5f"][Math.floor(Math.random()*5)],invite_code:ID().toUpperCase().substr(0,8),created_at:Date.now()};
+    const saved=await DB.upsertBoard(b);
+    const board=saved||b;
+    setBoards(prev=>[...prev,board]);
+    setAb(board);
+  };
+
+  const selBoard=async b=>{
+    const bs=await DB.getBoards(user.id);
+    const fresh=bs.find(x=>x.id===b.id)||b;
+    setAb(fresh);
+  };
+
   const addColFn=()=>{if(!newColNm.trim()||!ab)return;const cls=["#8b95a5","#5ba4f5","#b07cff","#f5a623","#63d297","#ef5f5f","#e891dc","#45c7d1"];svBoard({...ab,columns:[...ab.columns,{id:ID(),name:newColNm.trim(),color:cls[Math.floor(Math.random()*cls.length)]}]});setNewColNm("");setShowAddCol(false);};
   const updCol=col=>{if(!ab)return;svBoard({...ab,columns:ab.columns.map(c=>c.id===col.id?col:c)});};
   const delCol=cid=>{if(!ab)return;const u={...ab,columns:ab.columns.filter(c=>c.id!==cid)};svBoard(u);if(u.columns.length>0)setCards(prev=>prev.map(c=>c.column===cid?{...c,column:u.columns[0].id}:c));};
-  const addCard=card=>setCards(prev=>[...prev,card]);
-  const updCard=u=>{if(u.dueDate&&u.createdDate){const cp1=midDate(u.createdDate,u.dueDate);const cp2d=daysBetween(u.createdDate,u.dueDate)>1?addDays(u.dueDate,-1):u.dueDate;const ex=u.checkpoints||{};u.checkpoints={cp1:{...(ex.cp1||{}),date:ex.cp1?.checked?ex.cp1.date:cp1,originalDate:cp1,label:"Checkpoint 1 — Midway Review",checked:ex.cp1?.checked||false,delayed:ex.cp1?.delayed||false},cp2:{...(ex.cp2||{}),date:ex.cp2?.checked?ex.cp2.date:cp2d,originalDate:cp2d,label:"Checkpoint 2 — Pre-Delivery",checked:ex.cp2?.checked||false,delayed:ex.cp2?.delayed||false},delivery:{...(ex.delivery||{}),date:u.dueDate,label:"Delivery Due",checked:ex.delivery?.checked||false,delayed:ex.delivery?.delayed||false}};}setCards(prev=>prev.map(c=>c.id===u.id?u:c));};
-  const delCard=id=>setCards(prev=>prev.filter(c=>c.id!==id));
-  const moveCard=(cid,nc)=>{setCards(prev=>prev.map(c=>{if(c.id!==cid)return c;const f=ab.columns.find(x=>x.id===c.column);const t=ab.columns.find(x=>x.id===nc);return{...c,column:nc,changelog:[...(c.changelog||[]),log(user?.name||"?","moved card",`${f?.name||c.column} → ${t?.name||nc}`)]};}));};
-  const togCP=(cid,cpk)=>{setCards(prev=>prev.map(c=>{if(c.id!==cid||!c.checkpoints?.[cpk])return c;const w=c.checkpoints[cpk].checked;return{...c,changelog:[...(c.changelog||[]),log(user?.name||"?",w?"unchecked checkpoint":"checked checkpoint",c.checkpoints[cpk].label)],checkpoints:{...c.checkpoints,[cpk]:{...c.checkpoints[cpk],checked:!w}}};}));};
+  const addCard=card=>{setCards(prev=>[...prev,card]);if(ab)DB.upsertCard(ab.id,card);};
+  const updCard=u=>{if(u.dueDate&&u.createdDate){const cp1=midDate(u.createdDate,u.dueDate);const cp2d=daysBetween(u.createdDate,u.dueDate)>1?addDays(u.dueDate,-1):u.dueDate;const ex=u.checkpoints||{};u.checkpoints={cp1:{...(ex.cp1||{}),date:ex.cp1?.checked?ex.cp1.date:cp1,originalDate:cp1,label:"Checkpoint 1 — Midway Review",checked:ex.cp1?.checked||false,delayed:ex.cp1?.delayed||false},cp2:{...(ex.cp2||{}),date:ex.cp2?.checked?ex.cp2.date:cp2d,originalDate:cp2d,label:"Checkpoint 2 — Pre-Delivery",checked:ex.cp2?.checked||false,delayed:ex.cp2?.delayed||false},delivery:{...(ex.delivery||{}),date:u.dueDate,label:"Delivery Due",checked:ex.delivery?.checked||false,delayed:ex.delivery?.delayed||false}};}setCards(prev=>prev.map(c=>c.id===u.id?u:c));if(ab)DB.upsertCard(ab.id,u);};
+  const delCard=id=>{setCards(prev=>prev.filter(c=>c.id!==id));DB.deleteCard(id);};
+  const moveCard=(cid,nc)=>{setCards(prev=>prev.map(c=>{if(c.id!==cid)return c;const f=ab.columns.find(x=>x.id===c.column);const t=ab.columns.find(x=>x.id===nc);const updated={...c,column:nc,changelog:[...(c.changelog||[]),log(user?.name||"?","moved card",`${f?.name||c.column} → ${t?.name||nc}`)]};if(ab)DB.upsertCard(ab.id,updated);return updated;}));};
+  const togCP=(cid,cpk)=>{setCards(prev=>prev.map(c=>{if(c.id!==cid||!c.checkpoints?.[cpk])return c;const w=c.checkpoints[cpk].checked;const updated={...c,changelog:[...(c.changelog||[]),log(user?.name||"?",w?"unchecked checkpoint":"checked checkpoint",c.checkpoints[cpk].label)],checkpoints:{...c.checkpoints,[cpk]:{...c.checkpoints[cpk],checked:!w}}};if(ab)DB.upsertCard(ab.id,updated);return updated;}));};
+
   if(loading)return<div style={{minHeight:"100vh",background:T.bg,display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'Outfit',sans-serif"}}><style>{css(T)}</style><p style={{color:T.txD,fontFamily:"'JetBrains Mono',monospace"}}>Loading...</p></div>;
   if(!user)return<div><style>{css(T)}</style><Auth onLogin={login} T={T} theme={theme} toggle={toggle}/></div>;
   if(!ab)return<div><style>{css(T)}</style><BHome user={user} boards={boards} onSelect={selBoard} onCreate={mkBoard} onLogout={logout} T={T} theme={theme} toggle={toggle}/></div>;
